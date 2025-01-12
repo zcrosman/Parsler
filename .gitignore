@@ -1,0 +1,3 @@
+*.log
+parsler_report/*
+.vscode/*
