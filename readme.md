@@ -83,4 +83,7 @@ Effectively reviewing the output from Snaffler is crucial for identifying and mi
 
 Addressing these risks promptly helps strengthen your organization’s security posture and prevents potential data breaches. Parsler simplifies this process, enabling a more efficient and accurate review.
 
+## Credit
+The code for this tool was inspired by SnafflerParser. My original version of this tool generated text files and relied heavily on grep for searching through the Snaffler output. While this approach was functional, it lacked a user-friendly interface. The design of SnafflerParser served as the inspiration for transforming the results into a more accessible web page format, which was then expanded upon with additional features.
+
 
