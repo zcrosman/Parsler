@@ -953,7 +953,7 @@ def main():
         input_lines = sum(1 for _ in open(args.log, encoding='utf-8', errors='ignore'))
         if input_lines >= 1:
             with open(args.log, 'r', encoding='utf-8', errors='ignore') as csvfile:
-                data_reader = csv.DictReader(csvfile, delimiter='\t', fieldnames=['user', 'timestamp', 'typ', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10'])
+                data_reader = csv.DictReader(csvfile, delimiter='\t', fieldnames=['user', 'timestamp', 'typ', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11'])
                 data = list(data_reader)
             outputname = os.path.splitext(os.path.basename(args.log))[0]
             baseInfo = {
@@ -988,7 +988,7 @@ def main():
             modified   = html.escape(line['8'])
             unc_path   = html.escape(line['9'])
             extension  = html.escape(os.path.splitext(line['9'])[1])
-            content    = html.escape(line['10'] or "")
+            content    = html.escape(line['11'] or line['10'] or "")
 
             file_entry = {
                 'severity': severity,
