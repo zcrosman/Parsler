@@ -245,11 +245,12 @@ def generate_tree_html(jstree_data, outputname, out_dir):
         <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
         <!-- jsTree JS -->
         <script src="https://cdnjs.cloudflare.com/ajax/libs/jstree/3.3.12/jstree.min.js"></script>
+        <script src="tree_data.js"></script>
         <script>
             document.addEventListener('DOMContentLoaded', function() {{
                 $('#jstree').jstree({{
                     'core': {{
-                        'data': {json.dumps(jstree_data)},
+                        'data': PARSLER_TREE_DATA,
                         'check_callback': true
                     }},
                     // Use search plugin with custom callback for real regex,
@@ -387,6 +388,13 @@ def generate_tree_html(jstree_data, outputname, out_dir):
     </body>
     </html>
     """
+
+    tree_data_file = os.path.join(out_dir, "tree_data.js")
+    print(f"Saving: {tree_data_file}")
+    with open(tree_data_file, 'w', encoding='utf-8') as f:
+        f.write('const PARSLER_TREE_DATA=')
+        json.dump(jstree_data, f)
+        f.write(';\n')
 
     filename = os.path.join(out_dir, "tree.html")
     print(f"Saving: {filename}")
@@ -935,6 +943,452 @@ def export_help_html(out_dir):
         f.write(help_html)
 
 
+def export_data_js(objects, out_dir):
+    keys = ['severity', 'rule', 'keyword', 'modified', 'extension', 'unc', 'content']
+    rows = [[html.unescape(obj.get(k) or '') for k in keys] for obj in objects]
+    filename = os.path.join(out_dir, 'data.js')
+    print(f"Saving: {filename}")
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write('const PARSLER_KEYS=')
+        json.dump(keys, f)
+        f.write(';\nconst PARSLER_DATA=')
+        json.dump(rows, f)
+        f.write(';\n')
+
+
+def export_full_html(out_dir):
+    js = r"""
+const PAGE_SIZE = 500;
+let filteredData = [], sortCol = null, sortDir = 'asc', currentPage = 0;
+let SEARCH_INDEX = null;
+let searchId = 0;
+const SEV_ORDER = {Black:0, Red:1, Yellow:2, Green:3};
+
+const QUICK_FILTERS = [
+    {name:'Office Docs',          col:4, val:String.raw`\.(doc|xls|ppt|docx|xlsx|pptx)$`},
+    {name:'Password Filenames',   col:1, val:'password|pwd|cred'},
+    {name:'Connection Strings',   col:2, val:'connectionstring'},
+    {name:'SA Account',           col:6, val:String.raw`\\?["']?sa\\?["']?`},
+    {name:'Connection String PW', col:6, val:';Password='},
+    {name:'Config Files',         col:4, val:String.raw`\.(config|conf|cfg|ini|xml|json|yaml|yml)$`},
+    {name:'Log Files',            col:4, val:String.raw`\.(log|txt)$`},
+    {name:'Backup Files',         col:4, val:String.raw`\.(bak|backup|old|tmp)$`},
+    {name:'Database Files',       col:4, val:String.raw`\.(db|sqlite|sql|mdf|sdf|dat|accdb)$`},
+    {name:'Email Files',          col:4, val:String.raw`\.(pst|ost|eml|msg)$`},
+    {name:'Certificate Files',    col:4, val:String.raw`\.(pem|crt|cer|pfx|p12|key)$`},
+    {name:'Source Code',          col:4, val:String.raw`\.(py|js|java|c|cpp|ts|rb|go|php|sh|bat)$`},
+    {name:'Key Files',            col:4, val:String.raw`\.(pem|ppk|key|ssh)$`},
+    {name:'Financial Data',       col:5, val:'financial|invoice|receipt'},
+    {name:'Private Keys',         col:6, val:'PRIVATE KEY'},
+    {name:'Health Records',       col:6, val:'(hipaa|medical|patient)'},
+    {name:'Archived Files',       col:4, val:String.raw`\.(zip|tar|gz|7z|rar|iso)$`},
+    {name:'Reset Filters',        col:null, val:null},
+];
+
+function esc(s) {
+    return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function highlightText(raw, re) {
+    if (!re || !raw) return esc(raw || '');
+    re = new RegExp(re.source, (re.flags || 'g').replace(/g/g, '') + 'g');
+    let result = '', last = 0, m;
+    while ((m = re.exec(raw)) !== null) {
+        result += esc(raw.slice(last, m.index)) + '<mark>' + esc(m[0]) + '</mark>';
+        last = m.index + m[0].length;
+        if (m[0].length === 0) { re.lastIndex++; break; }
+    }
+    return result + esc(raw.slice(last));
+}
+
+function makeRe(s, flags) {
+    if (!s) return null;
+    try { return new RegExp(s, flags || 'i'); } catch(e) { return null; }
+}
+
+function getColInputs() {
+    return [...document.querySelectorAll('.filter-row input,.filter-row select')];
+}
+
+function getFilters() {
+    return {
+        search: document.getElementById('search-input').value.trim(),
+        cols: getColInputs().map(el => el.value.trim())
+    };
+}
+
+function showStatus(msg, busy) {
+    const el = document.getElementById('search-status');
+    el.textContent = msg;
+    el.classList.toggle('busy', !!busy);
+}
+
+let filterTimer = null;
+function scheduleFilter() {
+    if (filterTimer) clearTimeout(filterTimer);
+    filterTimer = setTimeout(applyFilters, 300);
+}
+
+async function applyFilters() {
+    const myId = ++searchId;
+    const f = getFilters();
+
+    const hasSearch   = f.search !== '';
+    const hasColFilter = f.cols.some(v => v !== '');
+
+    // Fast path: nothing active — just show everything
+    if (!hasSearch && !hasColFilter) {
+        filteredData = PARSLER_DATA;
+        if (sortCol !== null) sortInPlace();
+        currentPage = 0;
+        renderPage();
+        renderPagination();
+        showStatus(PARSLER_DATA.length.toLocaleString() + ' findings', false);
+        saveFilters();
+        return;
+    }
+
+    showStatus('Searching… 0%', true);
+    await new Promise(r => setTimeout(r, 0)); // flush status to screen
+
+    const mainRe    = makeRe(f.search, 'i');
+    const colRes    = f.cols.map(v => makeRe(v, 'i'));
+    const lowerSearch = f.search.toLowerCase();
+    // Simple text: no regex metacharacters — use fast indexOf path
+    const isSimple  = hasSearch && !/[.*+?^${}()|[\]\\]/.test(f.search);
+
+    const CHUNK = 3000;
+    const results = [];
+
+    for (let i = 0; i < PARSLER_DATA.length; i += CHUNK) {
+        if (searchId !== myId) return; // a newer search started — bail out
+
+        const end = Math.min(i + CHUNK, PARSLER_DATA.length);
+        for (let j = i; j < end; j++) {
+            const row = PARSLER_DATA[j];
+
+            // ── Main search ──────────────────────────────────────────────
+            if (hasSearch) {
+                if (isSimple) {
+                    if (!SEARCH_INDEX[j].includes(lowerSearch)) continue;
+                } else {
+                    mainRe.lastIndex = 0;
+                    if (!mainRe.test(SEARCH_INDEX[j])) continue;
+                }
+            }
+
+            // ── Column filters ───────────────────────────────────────────
+            let ok = true;
+            for (let c = 0; c < colRes.length; c++) {
+                if (!colRes[c]) continue;
+                colRes[c].lastIndex = 0;
+                if (!colRes[c].test(row[c] || '')) { ok = false; break; }
+            }
+            if (ok) results.push(row);
+        }
+
+        // Yield to UI between chunks so the browser stays responsive
+        await new Promise(r => setTimeout(r, 0));
+        showStatus('Searching… ' + Math.round(end / PARSLER_DATA.length * 100) + '%', true);
+    }
+
+    if (searchId !== myId) return;
+
+    filteredData = results;
+    if (sortCol !== null) sortInPlace();
+    currentPage = 0;
+    renderPage();
+    renderPagination();
+    showStatus(
+        results.length.toLocaleString() + ' of ' + PARSLER_DATA.length.toLocaleString() + ' findings',
+        false
+    );
+    saveFilters();
+}
+
+function sortInPlace() {
+    const sc = sortCol, sd = sortDir;
+    filteredData.sort((a, b) => {
+        let av = a[sc] || '', bv = b[sc] || '', cmp = 0;
+        if (sc === 0) cmp = (SEV_ORDER[av] ?? 99) - (SEV_ORDER[bv] ?? 99);
+        else { av = av.toLowerCase(); bv = bv.toLowerCase(); cmp = av < bv ? -1 : av > bv ? 1 : 0; }
+        return sd === 'asc' ? cmp : -cmp;
+    });
+}
+
+function renderPage() {
+    const f = getFilters();
+    const mainRe = makeRe(f.search, 'g');
+    const colRes = f.cols.map(v => makeRe(v, 'g'));
+    const slice  = filteredData.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE);
+    let h = '';
+    for (const row of slice) {
+        h += '<tr class="severity-' + esc(row[0] || '') + '">';
+        for (let i = 0; i < PARSLER_KEYS.length; i++) {
+            const raw = row[i] || '';
+            const res = [mainRe, colRes[i]].filter(Boolean);
+            let cell;
+            if (!res.length) {
+                cell = esc(raw);
+            } else {
+                const combined = new RegExp(res.map(r => r.source).join('|'), 'gi');
+                cell = highlightText(raw, combined);
+            }
+            h += '<td class="col-' + PARSLER_KEYS[i] + '">' + cell + '</td>';
+        }
+        h += '</tr>';
+    }
+    document.querySelector('tbody').innerHTML = h;
+}
+
+function renderPagination() {
+    const total = filteredData.length;
+    const pages = Math.ceil(total / PAGE_SIZE) || 1;
+    const start = total ? currentPage * PAGE_SIZE + 1 : 0;
+    const end   = Math.min((currentPage + 1) * PAGE_SIZE, total);
+    const text  = total
+        ? start.toLocaleString() + '–' + end.toLocaleString() + ' shown'
+        : 'No results';
+    document.querySelectorAll('.page-info').forEach(el => el.textContent = text);
+    document.querySelectorAll('.btn-prev').forEach(el => el.disabled = currentPage === 0);
+    document.querySelectorAll('.btn-next').forEach(el => el.disabled = currentPage >= pages - 1);
+}
+
+function saveFilters() {
+    const f = getFilters();
+    try {
+        localStorage.setItem('parslerFilters', JSON.stringify(
+            {search: f.search, cols: f.cols, sortCol, sortDir}
+        ));
+    } catch(e) {}
+}
+
+function loadFilters() {
+    try {
+        const s = localStorage.getItem('parslerFilters');
+        if (!s) return;
+        const st = JSON.parse(s);
+        if (st.search) document.getElementById('search-input').value = st.search;
+        if (st.cols) {
+            const inputs = getColInputs();
+            st.cols.forEach((v, i) => { if (inputs[i]) inputs[i].value = v; });
+        }
+        if (st.sortCol !== undefined) sortCol = st.sortCol;
+        if (st.sortDir) sortDir = st.sortDir;
+    } catch(e) {}
+}
+
+function resetFilters() {
+    document.getElementById('search-input').value = '';
+    getColInputs().forEach(el => el.value = '');
+    sortCol = null; sortDir = 'asc';
+    applyFilters();
+}
+
+function setQuickFilter(col, val) {
+    document.getElementById('search-input').value = '';
+    getColInputs().forEach(el => el.value = '');
+    sortCol = null; sortDir = 'asc';
+    if (col !== null) { const inputs = getColInputs(); if (inputs[col]) inputs[col].value = val; }
+    applyFilters();
+}
+
+function exportData(type) {
+    if (type === 'csv') {
+        let csv = PARSLER_KEYS.join(',') + '\n';
+        filteredData.forEach(row => {
+            csv += PARSLER_KEYS.map((_, i) => '"' + (row[i] || '').replace(/"/g, '""') + '"').join(',') + '\n';
+        });
+        dlBlob(csv, 'text/csv', 'parsler_export.csv');
+    } else {
+        const arr = filteredData.map(row => Object.fromEntries(PARSLER_KEYS.map((k, i) => [k, row[i] || ''])));
+        dlBlob(JSON.stringify(arr, null, 2), 'application/json', 'parsler_export.json');
+    }
+}
+
+function dlBlob(content, type, name) {
+    const a = Object.assign(document.createElement('a'),
+        {href: URL.createObjectURL(new Blob([content], {type})), download: name});
+    a.click(); URL.revokeObjectURL(a.href);
+}
+
+function changePage(delta) {
+    const pages = Math.ceil(filteredData.length / PAGE_SIZE) || 1;
+    const np = Math.max(0, Math.min(pages - 1, currentPage + delta));
+    if (np !== currentPage) { currentPage = np; renderPage(); renderPagination(); }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    // Build the search index once — join + lowercase every row so searches
+    // don't have to re-join on every keystroke
+    showStatus('Building index…', true);
+    SEARCH_INDEX = PARSLER_DATA.map(row => row.join('\t').toLowerCase());
+
+    // Quick filter buttons
+    const qfDiv = document.getElementById('quick-filters');
+    const hdr = document.createElement('div');
+    hdr.className = 'quick-filters-header'; hdr.textContent = 'Quick Filters';
+    qfDiv.appendChild(hdr);
+    QUICK_FILTERS.forEach(({name, col, val}) => {
+        const btn = document.createElement('button');
+        btn.className = 'qf-btn'; btn.textContent = name;
+        btn.addEventListener('click', () => col === null ? resetFilters() : setQuickFilter(col, val));
+        qfDiv.appendChild(btn);
+    });
+
+    // Export buttons
+    const expDiv = document.getElementById('export-buttons');
+    ['CSV', 'JSON'].forEach(t => {
+        const btn = document.createElement('button');
+        btn.textContent = 'Export ' + t;
+        btn.addEventListener('click', () => exportData(t.toLowerCase()));
+        expDiv.appendChild(btn);
+    });
+    const note = document.createElement('div');
+    note.className = 'export-note';
+    note.textContent = 'Exports all filtered rows, not just this page.';
+    expDiv.appendChild(note);
+
+    // Column header sorting
+    document.querySelectorAll('thead th').forEach((th, i) => {
+        th.classList.add('sortable');
+        th.addEventListener('click', () => {
+            sortDir = (sortCol === i && sortDir === 'asc') ? 'desc' : 'asc';
+            sortCol = i;
+            applyFilters();
+        });
+    });
+
+    document.getElementById('search-input').addEventListener('input', scheduleFilter);
+    getColInputs().forEach(el => el.addEventListener('input', scheduleFilter));
+    document.querySelectorAll('.btn-prev').forEach(el => el.addEventListener('click', () => changePage(-1)));
+    document.querySelectorAll('.btn-next').forEach(el => el.addEventListener('click', () => changePage(1)));
+
+    loadFilters();
+    applyFilters();
+});
+"""
+
+    css = """
+body{background-color:#2e2e2e;color:#e0e0e0;font-family:Arial,sans-serif;padding:20px;font-size:14px;}
+.nav-tabs{overflow:hidden;background-color:#1e1e1e;margin-bottom:20px;border-radius:5px;}
+.nav-tabs a{float:left;display:block;color:#e0e0e0;text-align:center;padding:10px 14px;text-decoration:none;transition:background-color 0.3s;border-right:1px solid #555;font-size:14px;}
+.nav-tabs a:last-child{border-right:none;}
+.nav-tabs a:hover,.nav-tabs a.active{background-color:#555;}
+h1{margin-top:0;}
+.table-wrapper{margin-top:10px;overflow-x:auto;}
+table{width:100%;border-collapse:collapse;background-color:#1e1e1e;border:1px solid #444;table-layout:fixed;}
+th,td{padding:4px 6px;border:1px solid #444;text-align:left;word-wrap:break-word;font-size:12px;}
+.col-severity{width:8%;}.col-rule{width:12%;}.col-keyword{width:10%;}.col-modified{width:10%;}
+.col-extension{width:5%;}.col-unc{width:25%;}.col-content{width:30%;}
+#search-input{width:100%;padding:10px;margin:10px 0 6px 0;background-color:#444;color:#fff;border:1px solid #555;border-radius:4px;box-sizing:border-box;}
+#search-input::placeholder{color:#ccc;}
+.filter-row input,.filter-row select{width:100%;padding:6px;margin:4px 0;background-color:#444;color:#fff;border:1px solid #555;border-radius:4px;box-sizing:border-box;}
+.filter-row input::placeholder{color:#ccc;}
+mark{background-color:yellow;color:#000;font-weight:bold;}
+tr.severity-Black:nth-child(even){background-color:#3d3d3d;color:#fff;}
+tr.severity-Black:nth-child(odd){background-color:#292929;color:#fff;}
+tr.severity-Red:nth-child(even){background-color:#ff5f57;color:#fff;}
+tr.severity-Red:nth-child(odd){background-color:#e92929;color:#fff;}
+tr.severity-Yellow:nth-child(even){background-color:#ffd760;color:#000;}
+tr.severity-Yellow:nth-child(odd){background-color:#ffcd00;color:#000;}
+tr.severity-Green:nth-child(even){background-color:#99e699;color:#000;}
+tr.severity-Green:nth-child(odd){background-color:#b3ffb3;color:#000;}
+tr:hover{background-color:#444!important;color:#fff!important;}
+.quick-filters{margin-bottom:10px;}
+.quick-filters-header{font-size:16px;margin-bottom:8px;color:#ffd760;}
+.qf-btn{margin-right:8px;margin-bottom:8px;padding:5px 10px;background-color:#444;color:#fff;border:1px solid #555;border-radius:4px;cursor:pointer;font-size:14px;}
+.qf-btn:hover{background-color:#555;}
+.export-buttons{margin-bottom:10px;}
+.export-buttons button{margin-right:10px;padding:6px 12px;background-color:#444;color:#fff;border:1px solid #555;border-radius:4px;cursor:pointer;font-size:14px;}
+.export-buttons button:hover{background-color:#555;}
+.export-note{font-size:12px;color:#ddd;margin-top:6px;}
+.sortable:hover{cursor:pointer;text-decoration:underline;}
+.pagination{display:flex;align-items:center;gap:12px;margin:8px 0;}
+.pagination button{padding:5px 14px;background-color:#444;color:#fff;border:1px solid #555;border-radius:4px;cursor:pointer;font-size:14px;}
+.pagination button:hover:not(:disabled){background-color:#555;}
+.pagination button:disabled{opacity:0.35;cursor:default;}
+.page-info{color:#e0e0e0;font-size:13px;}
+#search-status{font-size:13px;min-height:18px;margin:2px 0 8px 0;color:#aaa;letter-spacing:0.02em;}
+#search-status.busy{color:#ffd760;animation:status-pulse 1.2s ease-in-out infinite;}
+@keyframes status-pulse{0%,100%{opacity:1;}50%{opacity:0.45;}}
+"""
+
+    html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Parsler</title>
+<style>{css}</style>
+<script src="data.js"></script>
+<script>{js}</script>
+</head>
+<body>
+<div class="nav-tabs">
+    <a href="full.html" class="active">Main Report</a>
+    <a href="tree.html">Tree View</a>
+    <a href="stats.html">Stats</a>
+    <a href="help.html">Help</a>
+</div>
+<h1>Parsler - Main Report</h1>
+<div id="quick-filters" class="quick-filters"></div>
+<label for="search-input"><strong>Search:</strong></label>
+<input type="text" id="search-input" placeholder="Regex or plain text search across all columns..." />
+<div id="search-status"></div>
+<div id="export-buttons" class="export-buttons"></div>
+<div class="pagination">
+    <button class="btn-prev">&#8592; Prev</button>
+    <span class="page-info"></span>
+    <button class="btn-next">Next &#8594;</button>
+</div>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr>
+    <th class="col-severity">Severity</th>
+    <th class="col-rule">Rule</th>
+    <th class="col-keyword">Keyword</th>
+    <th class="col-modified">Modified</th>
+    <th class="col-extension">Ext</th>
+    <th class="col-unc">UNC Path</th>
+    <th class="col-content">Content</th>
+</tr>
+<tr class="filter-row">
+    <td class="col-severity">
+        <select>
+            <option value="">All</option>
+            <option value="Black">Black</option>
+            <option value="Red">Red</option>
+            <option value="Yellow">Yellow</option>
+            <option value="Green">Green</option>
+        </select>
+    </td>
+    <td class="col-rule"><input type="text" placeholder="Regex..." /></td>
+    <td class="col-keyword"><input type="text" placeholder="Regex..." /></td>
+    <td class="col-modified"><input type="text" placeholder="Regex..." /></td>
+    <td class="col-extension"><input type="text" placeholder="Regex..." /></td>
+    <td class="col-unc"><input type="text" placeholder="Regex..." /></td>
+    <td class="col-content"><input type="text" placeholder="Regex..." /></td>
+</tr>
+</thead>
+<tbody></tbody>
+</table>
+</div>
+<div class="pagination" style="margin-top:10px;">
+    <button class="btn-prev">&#8592; Prev</button>
+    <span class="page-info"></span>
+    <button class="btn-next">Next &#8594;</button>
+</div>
+</body>
+</html>"""
+
+    filename = os.path.join(out_dir, "full.html")
+    print(f"Saving: {filename}")
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+
+
+
 def main():
     parser = argparse.ArgumentParser(description='Parsler - Generate html pages to review Snaffler findings')
     parser.add_argument('-l', '--log', required=True, help='Snaffler log input (tsv format)')
@@ -1077,667 +1531,14 @@ def main():
         'modified_date_ranges': modified_date_ranges
     }
 
-    def export_html(objects, name, out_dir):
+    def _build_and_write_tree(objects, out_dir):
         tree_root_nodes = build_tree(objects)
         jstree_data = build_jstree(tree_root_nodes)
         generate_tree_html(jstree_data, outputname, out_dir)
 
-        filename = os.path.join(out_dir, "full.html")
-        print(f"Saving: {filename}")
-
-        keys = ['severity', 'rule', 'keyword', 'modified', 'extension', 'unc', 'content']
-
-        tree_page = "tree.html"
-        stats_page = "stats.html"
-        help_page = "help.html"
-
-        # The main "full.html" with filters, sorting, searching, exporting
-        html_template = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-        <meta charset="UTF-8">
-        <title>Parsler</title>
-        <style>
-        body {{
-            background-color: #2e2e2e;
-            color: #e0e0e0;
-            font-family: Arial, sans-serif;
-            padding: 20px;
-            font-size: 14px;
-        }}
-        .nav-tabs {{
-            overflow: hidden;
-            background-color: #1e1e1e;
-            margin-bottom: 20px;
-            border-radius: 5px;
-            position: relative;
-        }}
-        .nav-tabs a {{
-            float: left;
-            display: block;
-            color: #e0e0e0;
-            text-align: center;
-            padding: 10px 14px;
-            text-decoration: none;
-            transition: background-color 0.3s;
-            border-right: 1px solid #555;
-            font-size: 14px;
-        }}
-        .nav-tabs a:last-child {{
-            border-right: none;
-        }}
-        .nav-tabs a:hover {{
-            background-color: #555;
-        }}
-        .nav-tabs a.active {{
-            background-color: #555;
-        }}
-        h1 {{
-            margin-top: 0;
-        }}
-        .table-wrapper {{
-            margin-top: 20px;
-            overflow-x: auto;
-        }}
-        table {{
-            width: 100%;
-            border-collapse: collapse;
-            background-color: #1e1e1e;
-            border: 1px solid #444;
-            table-layout: fixed;
-        }}
-        th, td {{
-            padding: 4px 6px;
-            border: 1px solid #444;
-            text-align: left;
-            word-wrap: break-word;
-            font-size: 12px;
-        }}
-        .col-severity {{ width: 8%; }}
-        .col-rule {{ width: 12%; }}
-        .col-keyword {{ width: 10%; }}
-        .col-modified {{ width: 10%; }}
-        .col-extension {{ width: 5%; }}
-        .col-unc {{ width: 25%; }}
-        .col-content {{ width: 30%; }}
-        #search-input {{
-            width: 100%;
-            padding: 10px;
-            margin: 10px 0 20px 0;
-            background-color: #444;
-            color: #ffffff;
-            border: 1px solid #555;
-            border-radius: 4px;
-            box-sizing: border-box;
-        }}
-        #search-input::placeholder {{
-            color: #cccccc;
-        }}
-        .filter-row input, .filter-row select {{
-            width: 100%;
-            padding: 6px;
-            margin: 4px 0;
-            background-color: #444;
-            color: #ffffff;
-            border: 1px solid #555;
-            border-radius: 4px;
-            box-sizing: border-box;
-        }}
-        .filter-row input::placeholder {{
-            color: #cccccc;
-        }}
-        mark, .highlight {{
-            background-color: yellow !important;
-            color: #000 !important;
-            font-weight: bold !important;
-        }}
-        tr.severity-Black:nth-child(even) {{
-            background-color: #3d3d3d;
-            color: #ffffff;
-        }}
-        tr.severity-Black:nth-child(odd) {{
-            background-color: #292929;
-            color: #ffffff;
-        }}
-        tr.severity-Red:nth-child(even) {{
-            background-color: #ff5f57;
-            color: #ffffff;
-        }}
-        tr.severity-Red:nth-child(odd) {{
-            background-color: #e92929;
-            color: #ffffff;
-        }}
-        tr.severity-Yellow:nth-child(even) {{
-            background-color: #ffd760;
-            color: #000000;
-        }}
-        tr.severity-Yellow:nth-child(odd) {{
-            background-color: #ffcd00;
-            color: #000000;
-        }}
-        tr.severity-Green:nth-child(even) {{
-            background-color: #99e699;
-            color: #000000;
-        }}
-        tr.severity-Green:nth-child(odd) {{
-            background-color: #b3ffb3;
-            color: #000000;
-        }}
-        tr:hover {{
-            background-color: #444;
-        }}
-        .quick-filters {{
-            margin-bottom: 10px;
-        }}
-        .quick-filters-header {{
-            font-size: 16px;
-            margin-bottom: 8px;
-            color: #ffd760;
-        }}
-        .qf-btn {{
-            margin-right: 8px;
-            margin-bottom: 8px;
-            padding: 5px 10px;
-            background-color: #444;
-            color: #ffffff;
-            border: 1px solid #555;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 14px;
-        }}
-        .qf-btn:hover {{
-            background-color: #555;
-        }}
-        .export-buttons {{
-            margin-bottom: 10px;
-        }}
-        .export-buttons button {{
-            margin-right: 10px;
-            padding: 6px 12px;
-            background-color: #444;
-            color: #ffffff;
-            border: 1px solid #555;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size:14px;
-        }}
-        .export-buttons button:hover {{
-            background-color: #555;
-        }}
-        .export-note {{
-            font-size: 12px;
-            color: #ddd;
-            margin-bottom: 10px;
-            margin-top: 10px;
-        }}
-        .sortable:hover {{
-            cursor: pointer;
-            text-decoration: underline;
-        }}
-        </style>
-        <script>
-        document.addEventListener('DOMContentLoaded', function() {{
-            let sortColumnIndex = null;
-            let sortDirection = 'asc';
-
-            function loadFilters() {{
-                const saved = localStorage.getItem('filterState');
-                if (!saved) return;
-                const state = JSON.parse(saved);
-                if (state.searchValue) document.querySelector('#search-input').value = state.searchValue;
-                const filterCells = document.querySelectorAll('.filter-row input, .filter-row select');
-                filterCells.forEach((filter, index) => {{
-                    const key = 'filter_' + index;
-                    if (state[key] !== undefined) {{
-                        filter.value = state[key];
-                    }}
-                }});
-                if (state.sortColumnIndex !== undefined) {{
-                    sortColumnIndex = state.sortColumnIndex;
-                    sortDirection = state.sortDirection;
-                }}
-            }}
-
-            function saveFilters() {{
-                const state = {{}};
-                state.searchValue = document.querySelector('#search-input').value;
-                const filterCells = document.querySelectorAll('.filter-row input, .filter-row select');
-                filterCells.forEach((filter, index) => {{
-                    const key = 'filter_' + index;
-                    state[key] = filter.value;
-                }});
-                state.sortColumnIndex = sortColumnIndex;
-                state.sortDirection = sortDirection;
-                localStorage.setItem('filterState', JSON.stringify(state));
-            }}
-
-            function resetFilters() {{
-                document.querySelectorAll('.filter-row input').forEach(input => {{
-                    input.value = '';
-                }});
-                document.querySelectorAll('.filter-row select').forEach(select => {{
-                    select.value = '';
-                }});
-                document.querySelector('#search-input').value = '';
-                sortColumnIndex = null;
-                sortDirection = 'asc';
-                saveFilters();
-                filterTable();
-            }}
-
-            function filterTable() {{
-                const filters = Array.from(document.querySelectorAll('.filter-row input, .filter-row select'));
-                const rows = Array.from(document.querySelectorAll('tbody tr'));
-                const searchValue = document.querySelector('#search-input').value.trim();
-
-                let mainRegex = null;
-                if (searchValue) {{
-                    try {{
-                        mainRegex = new RegExp(searchValue, 'gi');
-                    }} catch(e) {{
-                        console.error('Invalid main search regex:', searchValue);
-                    }}
-                }}
-
-                const colRegexes = [];
-                filters.forEach((filter, index) => {{
-                    const val = filter.value.trim();
-                    if (val !== '') {{
-                        try {{
-                            colRegexes[index] = new RegExp(val, 'i');
-                        }} catch(e) {{
-                            console.error('Invalid column filter regex:', val);
-                            colRegexes[index] = null;
-                        }}
-                    }} else {{
-                        colRegexes[index] = null;
-                    }}
-                }});
-
-                rows.forEach(row => {{
-                    const cells = row.querySelectorAll('td');
-
-                    // Restore un-highlighted text
-                    cells.forEach(cell => {{
-                        if (cell.dataset.origText) {{
-                            cell.innerHTML = cell.dataset.origText;
-                        }} else {{
-                            cell.dataset.origText = cell.innerHTML;
-                        }}
-                    }});
-
-                    let matchesSearch = true;
-                    if (mainRegex) {{
-                        matchesSearch = mainRegex.test(row.textContent);
-                        mainRegex.lastIndex = 0;
-                    }}
-
-                    let matchesFilters = true;
-                    filters.forEach((filter, colIndex) => {{
-                        const val = filter.value.trim();
-                        if (!val) return;
-                        if (!colRegexes[colIndex]) return;
-
-                        const cellText = cells[colIndex].textContent;
-                        if (!colRegexes[colIndex].test(cellText)) {{
-                            matchesFilters = false;
-                        }}
-                        colRegexes[colIndex].lastIndex = 0;
-                    }});
-
-                    if (matchesSearch && matchesFilters) {{
-                        row.style.display = '';
-                        // Highlight matches (both master search & column filters)
-                        cells.forEach((cell, colIndex) => {{
-                            let orig = cell.innerHTML;
-                            // Master search highlight
-                            if (mainRegex) {{
-                                orig = orig.replace(mainRegex, match => '<span class="highlight">' + match + '</span>');
-                                mainRegex.lastIndex = 0;
-                            }}
-                            // Column filter highlight
-                            if (colRegexes[colIndex]) {{
-                                orig = orig.replace(colRegexes[colIndex], match => '<span class="highlight">' + match + '</span>');
-                                colRegexes[colIndex].lastIndex = 0;
-                            }}
-                            cell.innerHTML = orig;
-                        }});
-                    }} else {{
-                        row.style.display = 'none';
-                    }}
-                }});
-
-                if (sortColumnIndex !== null) {{
-                    sortRows(rows);
-                }}
-
-                saveFilters();
-            }}
-
-            function sortRows(rows) {{
-                const tbody = document.querySelector('tbody');
-                const visibleRows = rows.filter(r => r.style.display !== 'none');
-                visibleRows.sort((a,b) => {{
-                    const aCell = a.children[sortColumnIndex].textContent.trim();
-                    const bCell = b.children[sortColumnIndex].textContent.trim();
-                    let cmp = 0;
-                    if (sortColumnIndex === 0) {{
-                        const severityOrder = {{'Black':1, 'Red':2, 'Yellow':3, 'Green':4}};
-                        cmp = (severityOrder[aCell] || 99) - (severityOrder[bCell] || 99);
-                    }} else {{
-                        const aLower = aCell.toLowerCase();
-                        const bLower = bCell.toLowerCase();
-                        if (aLower < bLower) cmp = -1;
-                        else if (aLower > bLower) cmp = 1;
-                    }}
-                    return sortDirection === 'asc' ? cmp : -cmp;
-                }});
-                visibleRows.forEach(r => tbody.appendChild(r));
-            }}
-
-            function initColumnSorting() {{
-                const headers = document.querySelectorAll('thead th');
-                headers.forEach((th, i) => {{
-                    th.classList.add('sortable');
-                    th.addEventListener('click', () => {{
-                        if (sortColumnIndex === i) {{
-                            sortDirection = (sortDirection === 'asc') ? 'desc' : 'asc';
-                        }} else {{
-                            sortColumnIndex = i;
-                            sortDirection = 'asc';
-                        }}
-                        filterTable();
-                    }});
-                }});
-            }}
-
-            function exportFilteredData(type) {{
-                const rows = Array.from(document.querySelectorAll('tbody tr')).filter(r => r.style.display !== 'none');
-                const headers = Array.from(document.querySelectorAll('thead th'));
-                const colKeys = headers.map(h => h.textContent.toLowerCase());
-
-                if (type === 'csv') {{
-                    let csvContent = colKeys.join(',') + '\\n';
-                    rows.forEach(r => {{
-                        const cells = Array.from(r.children).map(c => c.textContent.replace(/"/g,'""'));
-                        csvContent += '"' + cells.join('","') + '"\\n';
-                    }});
-                    const blob = new Blob([csvContent], {{type: 'text/csv'}});
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = 'filtered_data.csv';
-                    a.click();
-                    URL.revokeObjectURL(url);
-                }} else if (type === 'json') {{
-                    const jsonArray = rows.map(r => {{
-                        const obj = {{}};
-                        colKeys.forEach((k, idx) => {{
-                            obj[k] = r.children[idx].textContent;
-                        }});
-                        return obj;
-                    }});
-                    const blob = new Blob([JSON.stringify(jsonArray, null, 2)], {{type: 'application/json'}});
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = 'filtered_data.json';
-                    a.click();
-                    URL.revokeObjectURL(url);
-                }}
-            }}
-
-            const quickFilters = {{
-                'Office Docs': () => {{
-                    resetFilters();
-                    document.querySelector('.filter-row .col-extension input').value = '\\\\.(doc|xls|ppt)$';
-                    filterTable();
-                }},
-                'Connection Strings': () => {{
-                    resetFilters();
-                    document.querySelector('.filter-row .col-keyword input').value = 'connectionstring';
-                    filterTable();
-                }},
-                'Password Filenames': () => {{
-                    resetFilters();
-                    document.querySelector('.filter-row .col-rule input').value = 'password';
-                    filterTable();
-                }},
-                'SA Account': () => {{
-                    resetFilters();
-                    document.querySelector('.filter-row .col-content input').value = '\\\\\\\\?[\\\"\\\']?sa\\\\\\\\?[\\\"\\\']';
-                    filterTable();
-                }},
-                'Connection String PW': () => {{
-                    resetFilters();
-                    document.querySelector('.filter-row .col-content input').value = ';Password=';
-                    filterTable();
-                }},
-                'Configuration Files': () => {{
-                    resetFilters();
-                    document.querySelector('.filter-row .col-extension input').value = '\\\\.(config|conf|cfg|ini|xml|json|yaml|yml)$';
-                    filterTable();
-                }},
-                'Log Files': () => {{
-                    resetFilters();
-                    document.querySelector('.filter-row .col-extension input').value = '\\\\.(log|txt)$';
-                    filterTable();
-                }},
-                'Backup Files': () => {{
-                    resetFilters();
-                    document.querySelector('.filter-row .col-extension input').value = '\\\\.(bak|backup|old|tmp)$';
-                    filterTable();
-                }},
-                'Executable Files': () => {{
-                    resetFilters();
-                    document.querySelector('.filter-row .col-extension input').value = '\\\\.(exe|dll|bat|sh|ps1|bin)$';
-                    filterTable();
-                }},
-                'Database Files': () => {{
-                    resetFilters();
-                    document.querySelector('.filter-row .col-extension input').value = '\\\\.(db|sqlite|sql|mdf|sdf|dat|accdb)$';
-                    filterTable();
-                }},
-                'Email Files': () => {{
-                    resetFilters();
-                    document.querySelector('.filter-row .col-extension input').value = '\\\\.(pst|ost|eml|msg)$';
-                    filterTable();
-                }},
-                'Certificate Files': () => {{
-                    resetFilters();
-                    document.querySelector('.filter-row .col-extension input').value = '\\\\.(pem|crt|cer|pfx|p12|key)$';
-                    filterTable();
-                }},
-                'Source Code Files': () => {{
-                    resetFilters();
-                    document.querySelector('.filter-row .col-extension input').value = '\\\\.(py|js|java|c|cpp|ts|rb|go|php|sh|bat)$';
-                    filterTable();
-                }},
-                'Key Files': () => {{
-                    resetFilters();
-                    document.querySelector('.filter-row .col-extension input').value = '\\\\.(pem|ppk|key|ssh)$';
-                    filterTable();
-                }},
-                'Financial Data': () => {{
-                    resetFilters();
-                    // document.querySelector('.filter-row .col-extension input').value = '\\\\.(xls|xlsx|csv)$';
-                    document.querySelector('.filter-row .col-unc input').value = 'financial|invoice|receipt';
-                    filterTable();
-                }},
-                'Personal Data': () => {{
-                    resetFilters();
-                    document.querySelector('.filter-row .col-content input').value = '(ssn|social security|dob|birthdate)';
-                    filterTable();
-                }},
-                'Encryption Keys': () => {{
-                    resetFilters();
-                    document.querySelector('.filter-row .col-content input').value = 'AES|RSA|PGP';
-                    filterTable();
-                }},
-                'Private Keys': () => {{
-                    resetFilters();
-                    document.querySelector('.filter-row .col-content input').value = 'PRIVATE KEY';
-                    filterTable();
-                }},
-                'Health Records': () => {{
-                    resetFilters();
-                    document.querySelector('.filter-row .col-content input').value = '(hipaa|medical|patient)';
-                    filterTable();
-                }},
-                'Executable or Scripts': () => {{
-                    resetFilters();
-                    document.querySelector('.filter-row .col-extension input').value = '\\\\.(exe|dll|sh|bat|ps1|vbs|cmd|pl)$';
-                    filterTable();
-                }},
-                'Archived Files': () => {{
-                    resetFilters();
-                    document.querySelector('.filter-row .col-extension input').value = '\\\\.(zip|tar|gz|7z|rar|iso)$';
-                    filterTable();
-                }},
-                'Reset Filters': () => {{
-                    resetFilters();
-                    filterTable();
-                }}
-            }};
-
-            function createExportButtons() {{
-                const container = document.createElement('div');
-                container.className = 'export-buttons';
-                const csvBtn = document.createElement('button');
-                csvBtn.textContent = 'Export CSV';
-                csvBtn.addEventListener('click', () => exportFilteredData('csv'));
-                container.appendChild(csvBtn);
-
-                const jsonBtn = document.createElement('button');
-                jsonBtn.textContent = 'Export JSON';
-                jsonBtn.addEventListener('click', () => exportFilteredData('json'));
-                container.appendChild(jsonBtn);
-
-                const note = document.createElement('div');
-                note.className = 'export-note';
-                note.textContent = 'Note: Export only includes currently visible (filtered) rows.';
-                container.appendChild(note);
-
-                const quickFiltersDiv = document.querySelector('.quick-filters');
-                quickFiltersDiv.parentNode.insertBefore(container, quickFiltersDiv);
-            }}
-
-            function createQuickFiltersHeaderAndButtons() {{
-                const quickFilterContainer = document.querySelector('.quick-filters');
-                const quickFiltersHeader = document.createElement('div');
-                quickFiltersHeader.className = 'quick-filters-header';
-                quickFiltersHeader.textContent = 'Quick Filters (WIP)';
-                quickFilterContainer.appendChild(quickFiltersHeader);
-
-                Object.keys(quickFilters).forEach(filterName => {{
-                    const button = document.createElement('button');
-                    button.textContent = filterName;
-                    button.addEventListener('click', quickFilters[filterName]);
-                    button.className = 'qf-btn';
-                    quickFilterContainer.appendChild(button);
-                }});
-            }}
-
-            function setActiveTab(currentPage) {{
-                const tabs = document.querySelectorAll('.nav-tabs a');
-                tabs.forEach(tab => {{
-                    if (tab.textContent === currentPage) {{
-                        tab.classList.add('active');
-                    }} else {{
-                        tab.classList.remove('active');
-                    }}
-                }});
-            }}
-
-            loadFilters();
-            initColumnSorting();
-            filterTable();
-            document.querySelector('#search-input').addEventListener('input', filterTable);
-            document.querySelectorAll('.filter-row input, .filter-row select').forEach(f => {{
-                f.addEventListener('input', filterTable);
-            }});
-            createExportButtons();
-            createQuickFiltersHeaderAndButtons();
-            setActiveTab('Main Report');
-        }});
-        </script>
-        </head>
-        <body>
-            <div class="nav-tabs">
-                <a href="full.html" class="tab-link active">Main Report</a>
-                <a href="{tree_page}" class="tab-link">Tree View</a>
-                <a href="{stats_page}" class="tab-link">Stats</a>
-                <a href="{help_page}" class="tab-link">Help</a>
-            </div>
-
-            <h1>Parsler - Main Report</h1>
-
-            <div class="quick-filters"></div>
-            <label for="search-input"><strong>Search:</strong></label>
-            <input type="text" id="search-input" placeholder="Regex search across all columns..." />
-            <div class="export-buttons"></div>
-
-            <div class="table-wrapper">
-            <table>
-            <thead>
-            <tr>
-        """
-
-        # Table headers
-        for k in keys:
-            html_template += f"<th class='col-{k}'>{k.capitalize()}</th>"
-        html_template += """
-            </tr>
-            <tr class="filter-row">
-        """
-        # Column filter row
-        for k in keys:
-            if k == 'severity':
-                html_template += """
-                <td class='col-severity'>
-                    <select>
-                        <option value="">All</option>
-                        <option value="Black">Black</option>
-                        <option value="Red">Red</option>
-                        <option value="Yellow">Yellow</option>
-                        <option value="Green">Green</option>
-                    </select>
-                </td>
-                """
-            else:
-                html_template += f"<td class='col-{k}'><input type='text' placeholder='Regex filter...' /></td>"
-        html_template += """
-            </tr>
-            </thead>
-            <tbody>
-        """
-
-        for obj in objects:
-            severity_class = f"severity-{html.unescape(obj.get('severity', ''))}"
-            html_template += f"<tr class='{severity_class}'>"
-            for k in keys:
-                val = obj.get(k, '')
-                html_template += f"<td class='col-{k}'>{val}</td>"
-            html_template += "</tr>\n"
-
-        html_template += f"""
-            </tbody>
-            </table>
-            </div>
-            <p>
-                <a href="{tree_page}">View as Tree</a> | 
-                <a href="{stats_page}">View Stats</a> | 
-                <a href="{help_page}">Help</a>
-            </p>
-        </body>
-        </html>
-        """
-
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write(html_template)
-
-    export_html(fulloutput, 'full', args.out_dir)
+    _build_and_write_tree(fulloutput, args.out_dir)
+    export_data_js(fulloutput, args.out_dir)
+    export_full_html(args.out_dir)
     export_stats_html(
         stats_dict, 
         top_rules,
